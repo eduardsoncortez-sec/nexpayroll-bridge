@@ -1,0 +1,12 @@
+{
+  "name": "nexpayroll-biometric-bridge",
+  "version": "1.0.0",
+  "description": "Biometric bridge for NexVision Payroll - receives ZKTeco F80 push data and forwards to Supabase",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "node bridge.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.89.0"
+  }
+}
