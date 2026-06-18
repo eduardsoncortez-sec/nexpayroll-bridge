@@ -69,10 +69,20 @@ const server = http.createServer(async (req, res) => {
 
   // POST = data from device
   if (req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk.toString(); });
+    const chunks = [];
+    req.on("data", (chunk) => { chunks.push(chunk); });
     req.on("end", async () => {
+      // T800 may send data in Latin1/binary encoding, not UTF-8
+      const rawBuffer = Buffer.concat(chunks);
+      // Try UTF-8 first, then Latin1
+      let body = rawBuffer.toString("utf8");
+      // If we see garbled chars, try latin1
+      if (body.includes("\ufffd") || body.includes("�")) {
+        body = rawBuffer.toString("latin1");
+      }
+
       console.log(`[${timestamp}] POST body (first 500 chars): ${body.substring(0, 500)}`);
+      console.log(`[${timestamp}] Raw hex (first 100 bytes): ${rawBuffer.slice(0, 100).toString("hex")}`);
 
       try {
         // Try to parse as JSON first (T800 format)
