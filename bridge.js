@@ -39,7 +39,13 @@ const server = http.createServer(async (req, res) => {
   const table = url.searchParams.get("table") || url.searchParams.get("TABLE") || "";
 
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.url} (SN: ${sn || "none"})`);
+  const requestCode = String(req.headers["request_code"] || "");
+  const transId = String(req.headers["trans_id"] || "");
+  const deviceId = String(req.headers["dev_id"] || sn || "");
+  console.log(
+    `[${timestamp}] ${req.method} ${req.url} ` +
+    `(request: ${requestCode || "none"}, device: ${deviceId || "none"}, block: ${req.headers["blk_no"] || "none"})`
+  );
 
   // Health check
   if (url.pathname === "/health") {
@@ -85,9 +91,13 @@ const server = http.createServer(async (req, res) => {
       console.log(`[${timestamp}] Raw hex (first 100 bytes): ${rawBuffer.slice(0, 100).toString("hex")}`);
 
       try {
-        // Try to parse as JSON first (T800 format)
-        if (body.trim().startsWith("{") || body.trim().startsWith("[")) {
-          const jsonData = JSON.parse(body);
+        // FaceBS/F80 firmware may prefix JSON with a 4-byte packet length
+        // and append a trailing NUL byte.
+        const embeddedJson = extractEmbeddedJson(body);
+
+        // Try to parse as JSON first (T800/F80 format)
+        if (embeddedJson) {
+          const jsonData = JSON.parse(embeddedJson);
           await handleT800Json(jsonData, sn);
         }
         // Check for ATTLOG tab-separated format (F80/ZKTeco ADMS)
@@ -108,9 +118,8 @@ const server = http.createServer(async (req, res) => {
         await logRawData(body, sn);
       }
 
-      // Always respond OK to device
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("OK");
+      // FK HTTP Push protocol expects these response headers.
+      sendDeviceResponse(res, requestCode, transId);
     });
     return;
   }
@@ -133,22 +142,22 @@ async function handleT800Json(data, sn) {
 
   for (const record of records) {
     // Skip enrollment data (not attendance)
-    if (record.enroll_data || record.template) {
+    if (record.enroll_data || record.enroll_data_array || record.template || record.fk_info) {
       console.log(`[T800] Enrollment data for user ${record.user_id} — skipping (not attendance)`);
       continue;
     }
 
     // Attendance record
     const userId = record.user_id || record.pin || record.userId;
-    const punchTimeStr = record.punch_time || record.timestamp || record.time;
-    const verifyType = record.verify_type || record.verifyType || 0;
+    const punchTimeStr = record.punch_time || record.timestamp || record.time || record.io_time;
+    const verifyType = record.verify_type || record.verifyType || record.verify_mode || 0;
 
     if (!userId || !punchTimeStr) {
       console.log(`[T800] Missing user_id or punch_time in record:`, JSON.stringify(record).substring(0, 200));
       continue;
     }
 
-    const punchTime = new Date(punchTimeStr);
+    const punchTime = parseDeviceTime(punchTimeStr);
     if (isNaN(punchTime.getTime())) {
       console.error(`[T800] Invalid punch time: ${punchTimeStr}`);
       continue;
@@ -156,13 +165,18 @@ async function handleT800Json(data, sn) {
 
     console.log(`[T800] Attendance: User ${userId} at ${punchTimeStr} (verify: ${verifyType})`);
 
+    if (await attendanceLogExists(String(userId), punchTime)) {
+      console.log(`[T800] Duplicate attendance ignored: User ${userId} at ${punchTimeStr}`);
+      continue;
+    }
+
     // Store raw log
     await supabase.from("biometric_logs").insert({
       company_id: COMPANY_ID,
       device_sn: sn || "T800",
       biometric_user_id: String(userId),
       punch_time: punchTime.toISOString(),
-      punch_type: 0,
+      punch_type: Number(record.io_mode ?? 0),
       verify_type: verifyType,
       raw_payload: record,
       processed: false,
@@ -171,6 +185,47 @@ async function handleT800Json(data, sn) {
     // Process into attendance
     await processAttendance(String(userId), punchTime, sn || "T800");
   }
+}
+
+function extractEmbeddedJson(body) {
+  const end = body.lastIndexOf("}");
+  if (end === -1) return null;
+
+  // The packet length header can itself contain the ASCII byte "{".
+  // Try every possible object start until one parses cleanly.
+  let start = -1;
+  while (true) {
+    start = body.indexOf("{", start + 1);
+    if (start === -1 || start >= end) return null;
+
+    const candidate = body.slice(start, end + 1);
+    try {
+      JSON.parse(candidate);
+      return candidate;
+    } catch {
+      // Continue to the next opening brace.
+    }
+  }
+}
+
+function sendDeviceResponse(res, requestCode, transId) {
+  res.setHeader("response_code", "OK");
+  if (transId) res.setHeader("trans_id", transId);
+  if (requestCode) res.setHeader("cmd_code", requestCode.toUpperCase());
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+}
+
+function parseDeviceTime(value) {
+  const text = String(value).trim();
+  const compact = text.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/);
+
+  if (compact) {
+    const [, year, month, day, hour, minute, second] = compact;
+    return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}+08:00`);
+  }
+
+  return new Date(text);
 }
 
 // ---------------------------------------------------------------
@@ -239,6 +294,11 @@ async function handleAttlog(body, sn, table) {
 
     console.log(`[ATTLOG] User ${userId} at ${punchTimeStr} (verify: ${verifyType}, mode: ${inOutMode})`);
 
+    if (await attendanceLogExists(userId, punchTime)) {
+      console.log(`[ATTLOG] Duplicate attendance ignored: User ${userId} at ${punchTimeStr}`);
+      continue;
+    }
+
     await supabase.from("biometric_logs").insert({
       company_id: COMPANY_ID,
       device_sn: sn || "unknown",
@@ -252,6 +312,23 @@ async function handleAttlog(body, sn, table) {
 
     await processAttendance(userId, punchTime, sn || "unknown");
   }
+}
+
+async function attendanceLogExists(biometricUserId, punchTime) {
+  const { data, error } = await supabase
+    .from("biometric_logs")
+    .select("id")
+    .eq("company_id", COMPANY_ID)
+    .eq("biometric_user_id", biometricUserId)
+    .eq("punch_time", punchTime.toISOString())
+    .limit(1);
+
+  if (error) {
+    console.error(`[Bridge] Duplicate check failed: ${error.message}`);
+    return false;
+  }
+
+  return Boolean(data?.length);
 }
 
 // ---------------------------------------------------------------
@@ -276,6 +353,18 @@ async function logRawData(body, sn) {
 // ---------------------------------------------------------------
 async function processAttendance(biometricUserId, punchTime, deviceSn) {
   const PH_TZ = "Asia/Manila";
+  const MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+  if (punchTime.getTime() > Date.now() + MAX_FUTURE_SKEW_MS) {
+    const message = `Device time is ahead of server time: ${punchTime.toISOString()}`;
+    console.error(`  ❌ ${message}`);
+    await supabase.from("biometric_logs")
+      .update({ error_message: message })
+      .eq("biometric_user_id", biometricUserId)
+      .eq("punch_time", punchTime.toISOString());
+    return;
+  }
+
   const todayStr = punchTime.toLocaleDateString("en-CA", { timeZone: PH_TZ });
   const timeStr = punchTime.toLocaleTimeString("en-US", {
     hour: "2-digit",
